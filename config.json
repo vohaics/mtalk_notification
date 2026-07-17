@@ -1,0 +1,32 @@
+{
+  "_comment": "MTalk notifier configuration. Edit target names to match your MTalk UI text exactly.",
+
+  "targets": [
+    {
+      "kind": "room",
+      "name": "NOC Internal (Handover)",
+      "display": "NOC Internal (Handover)"
+    },
+    {
+      "kind": "account",
+      "name": "GNMC",
+      "display": "GNMC"
+    }
+  ],
+
+  "window_title_hints": ["MTalk", "mTalk", "엠톡"],
+
+  "poll_interval_seconds": 1.0,
+
+  "sound_file": "sounds/warning.mp3",
+
+  "log_file": "logs/mtalk_notifier.log",
+
+  "popup": {
+    "width": 340,
+    "height": 200,
+    "always_on_top": true
+  },
+
+  "prefer_events": true
+}

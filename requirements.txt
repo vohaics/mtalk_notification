@@ -1,0 +1,13 @@
+# Windows-only runtime dependencies for the MTalk notifier.
+# Install with:  pip install -r requirements.txt
+
+# UI Automation binding for Windows (COM-based).
+# Provides both direct tree access and event handlers.
+uiautomation>=2.0.20 ; sys_platform == "win32"
+
+# COM plumbing used by uiautomation.
+comtypes>=1.2.0 ; sys_platform == "win32"
+
+# Lightweight audio playback that supports mid-playback stop().
+# Used for playing sounds/warning.mp3 and being able to mute it.
+pygame>=2.5.0

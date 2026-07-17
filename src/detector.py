@@ -33,12 +33,17 @@ from __future__ import annotations
 
 import logging
 import re
+import sys
 import threading
 import time
 from dataclasses import dataclass
 from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 from .config import AppConfig, Target
+
+
+def _is_windows() -> bool:
+    return sys.platform == "win32"
 
 
 log = logging.getLogger(__name__)
@@ -78,6 +83,11 @@ class MTalkDetector:
         self._auto = None  # imported lazily on Windows
         self._auto_ok = False
         self._event_hooks: list = []
+        self._com_initialised_on_thread = False
+
+        # Idempotency guard for stop()/release_resources().
+        self._stopped = threading.Event()
+        self._released = threading.Event()
 
     # ------------------------------------------------------------------ public
 
@@ -85,74 +95,170 @@ class MTalkDetector:
         if self._thread is not None:
             return
         self._stop.clear()
+        self._stopped.clear()
+        self._released.clear()
         self._thread = threading.Thread(
             target=self._run, name="mtalk-detector", daemon=True
         )
         self._thread.start()
 
-    def stop(self) -> None:
+    def stop(self, join_timeout_s: float = 3.0) -> None:
+        """Signal the detector thread to stop and join it.
+
+        Idempotent: safe to call multiple times from any thread.
+
+        Steps:
+        1. Set the stop event so the run loop exits at its next wait boundary.
+        2. Set the wake event so the loop doesn't have to wait a full
+           ``poll_interval_seconds`` before noticing.
+        3. Join the thread with a bounded timeout (the shutdown coordinator
+           has its own overall deadline as a backstop).
+        4. Release Windows UI Automation resources (event hooks + auto handle
+           + COM uninit if we initialised it on this thread).
+        """
+        if self._stopped.is_set():
+            return
+        self._stopped.set()
+
         self._stop.set()
         self._wake.set()
-        if self._thread is not None:
-            self._thread.join(timeout=3.0)
-            self._thread = None
-        self._remove_event_hooks()
+
+        thread = self._thread
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=join_timeout_s)
+            if thread.is_alive():
+                log.warning(
+                    "Detector thread did not exit within %.1fs; leaving as daemon.",
+                    join_timeout_s,
+                )
+        self._thread = None
+
+        self.release_resources()
+
+    def release_resources(self) -> None:
+        """Explicitly release Windows UI Automation resources.
+
+        - Removes any StructureChanged / PropertyChanged event hooks so the OS
+          doesn't keep callbacks pointing at freed Python objects.
+        - Drops the ``uiautomation`` module reference (any per-thread COM
+          state it created will be released when the detector thread's
+          COM apartment is uninitialised).
+        - Uninitialises COM on the detector thread if we initialised it.
+
+        Idempotent.
+        """
+        if self._released.is_set():
+            return
+        self._released.set()
+
+        try:
+            self._remove_event_hooks()
+        except Exception:
+            log.exception("Failed to remove UI Automation event hooks")
+
+        self._auto = None
+        self._auto_ok = False
+        log.info("UI Automation resources released")
 
     # ---------------------------------------------------------------- run loop
 
     def _run(self) -> None:
         log.info("Detector thread starting")
-        self._auto_ok = self._init_uiautomation()
-        if not self._auto_ok:
-            log.error(
-                "UI Automation is not available; detector cannot function on "
-                "this platform. This tool must run on Windows."
-            )
-            return
+        self._com_init_on_thread()
+        try:
+            self._auto_ok = self._init_uiautomation()
+            if not self._auto_ok:
+                log.error(
+                    "UI Automation is not available; detector cannot function on "
+                    "this platform. This tool must run on Windows."
+                )
+                return
 
-        events_subscribed = False
-        last_window_hwnd: Optional[int] = None
-        interval = max(0.1, float(self._cfg.poll_interval_seconds))
+            events_subscribed = False
+            last_window_hwnd: Optional[int] = None
+            interval = max(0.1, float(self._cfg.poll_interval_seconds))
 
-        while not self._stop.is_set():
-            try:
-                window = self._find_mtalk_window()
+            while not self._stop.is_set():
+                try:
+                    window = self._find_mtalk_window()
 
-                if window is None:
-                    # Window not found - drop any event subs and wait a bit.
-                    if events_subscribed:
-                        self._remove_event_hooks()
-                        events_subscribed = False
-                        last_window_hwnd = None
-                    log.debug("MTalk window not found; will retry.")
-                else:
-                    hwnd = self._safe_hwnd(window)
-                    if hwnd != last_window_hwnd:
-                        self._remove_event_hooks()
-                        events_subscribed = False
-                        last_window_hwnd = hwnd
-
-                    if self._cfg.prefer_events and not events_subscribed:
-                        events_subscribed = self._try_subscribe_events(window)
+                    if window is None:
+                        # Window not found - drop any event subs and wait a bit.
                         if events_subscribed:
-                            log.info(
-                                "Subscribed to UI Automation events on MTalk window."
-                            )
-                        else:
-                            log.info(
-                                "UI Automation events unavailable; falling back to polling."
-                            )
+                            self._remove_event_hooks()
+                            events_subscribed = False
+                            last_window_hwnd = None
+                        log.debug("MTalk window not found; will retry.")
+                    else:
+                        hwnd = self._safe_hwnd(window)
+                        if hwnd != last_window_hwnd:
+                            self._remove_event_hooks()
+                            events_subscribed = False
+                            last_window_hwnd = hwnd
 
-                    self._scan(window)
-            except Exception:  # keep the thread alive across transient failures
-                log.exception("Detector scan failed")
+                        if self._cfg.prefer_events and not events_subscribed:
+                            events_subscribed = self._try_subscribe_events(window)
+                            if events_subscribed:
+                                log.info(
+                                    "Subscribed to UI Automation events on MTalk window."
+                                )
+                            else:
+                                log.info(
+                                    "UI Automation events unavailable; falling back to polling."
+                                )
 
-            # Wait until poll interval or until an event nudges us.
-            self._wake.wait(timeout=interval)
-            self._wake.clear()
+                        self._scan(window)
+                except Exception:  # keep the thread alive across transient failures
+                    log.exception("Detector scan failed")
 
-        self._remove_event_hooks()
-        log.info("Detector thread stopped")
+                # Wait until poll interval or until an event nudges us.
+                self._wake.wait(timeout=interval)
+                self._wake.clear()
+        finally:
+            # Always remove event hooks and uninit COM before the thread ends,
+            # even if we're exiting because of an unhandled exception. This is
+            # the safest place to unhook, because UI Automation event handlers
+            # are per-thread and the OS callbacks land on this thread.
+            try:
+                self._remove_event_hooks()
+            except Exception:
+                log.exception("Error removing event hooks on thread exit")
+            self._com_uninit_on_thread()
+            log.info("Detector thread stopped")
+
+    # -------------------------------------------------------------------- COM
+
+    def _com_init_on_thread(self) -> None:
+        """Initialise COM (STA) on this thread so UI Automation event
+        callbacks are delivered here. No-op on non-Windows."""
+        if not _is_windows():
+            return
+        try:
+            import ctypes
+
+            hr = ctypes.windll.ole32.CoInitializeEx(None, 0x2)  # STA
+            # S_OK (0) means we initialised; S_FALSE (1) means already inited
+            # on this thread; RPC_E_CHANGED_MODE (0x80010106) means a different
+            # apartment mode was already active - all are OK to proceed.
+            self._com_initialised_on_thread = hr == 0
+            log.debug("CoInitializeEx returned 0x%x", hr & 0xFFFFFFFF)
+        except Exception:
+            log.exception("CoInitializeEx failed; continuing anyway")
+
+    def _com_uninit_on_thread(self) -> None:
+        if not _is_windows():
+            return
+        if not self._com_initialised_on_thread:
+            return
+        try:
+            import ctypes
+
+            ctypes.windll.ole32.CoUninitialize()
+            log.debug("CoUninitialize called on detector thread")
+        except Exception:
+            log.exception("CoUninitialize failed")
+        finally:
+            self._com_initialised_on_thread = False
 
     # -------------------------------------------------------- UI Automation IO
 

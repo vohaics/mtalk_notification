@@ -115,6 +115,71 @@ python -m src.main --verbose
 Logs are written to `logs/mtalk_notifier.log` (rotating, 1 MB × 3 files).
 Every detected new message is logged with target name and new unread count.
 
+### Stopping the notifier
+
+The notifier has **six independent shutdown triggers** — all of which route
+through the same central `ShutdownCoordinator` for an idempotent, LIFO,
+watchdog-bounded teardown (see `src/shutdown.py`).
+
+| Trigger | How | When to use it |
+| --- | --- | --- |
+| `stop.bat` | Sets Windows named event `MTalkNotifier_Stop` (via PowerShell) → falls back to writing `stop.request` → falls back to `taskkill /PID <pid>` (no `/F`). | Everyday shutdown for the silent background instance. |
+| `stop.request` file | `echo stop > stop.request` in the project folder. Watcher polls at `poll_interval_seconds`, deletes the file, triggers shutdown. | Scripted / cross-platform / no PowerShell. |
+| Windows named event | Any Windows program can `EventWaitHandle.OpenExisting('MTalkNotifier_Stop').Set()`. | Programmatic integration with other tooling. |
+| Signals | `Ctrl+C` (SIGINT), `taskkill /PID` (SIGTERM), `Ctrl+Break` (SIGBREAK on Windows). | Console/dev mode. |
+| Alt+F4 | Closes the hidden Tk root; fires `WM_DELETE_WINDOW` which triggers shutdown. | Rarely needed (the root is hidden). |
+| Uncaught exception | The main `try/except` in `main.py` triggers shutdown before re-raising. | Automatic on internal error. |
+
+**What "clean shutdown" actually means**, in the exact LIFO order the
+coordinator invokes them:
+
+1. **Detector** — signals the background thread, joins with 4 s timeout,
+   removes UI Automation `StructureChanged` / `PropertyChanged` event hooks,
+   drops the `uiautomation` handle, and calls `CoUninitialize` on the
+   detector thread if COM was initialised there.
+2. **Popup** — destroys the `Toplevel` if it's still visible.
+3. **Sound player** — stops any in-flight playback and calls
+   `pygame.mixer.quit()`.
+4. **Tk root** — breaks `mainloop()` and destroys the hidden root.
+5. **Stop-signal listener** — sets its own local stop flag, self-signals its
+   Windows event so the waiter thread wakes, joins the file- and
+   event-watcher threads, and closes the Windows event handle.
+6. **PID file** — removes `mtalk_notifier.pid`.
+
+**Guarantees:**
+
+- **Idempotent.** Every trigger path may fire concurrently (e.g. signal +
+  Alt+F4); only the first wins, the rest are logged and ignored.
+- **Bounded.** Each teardown action runs on its own thread with a
+  per-action timeout; a slow subsystem cannot block the others.
+- **Watchdog-guaranteed exit.** A wall-clock watchdog (`--shutdown-deadline`,
+  default **10 s**) fires `os._exit(1)` if graceful teardown ever hangs, so
+  the app can never leave a background process behind.
+- **Order-safe.** Registered LIFO so subsystems always tear down after
+  their dependents (detector before Tk before pygame quit before PID file).
+
+**Log evidence** — a real teardown (Ctrl+C on Linux for demo) looks like:
+
+```
+Received signal SIGINT
+Shutdown requested: signal:SIGINT
+Shutdown flag observed on Tk thread (reason=signal:SIGINT); exiting mainloop.
+Running 6 shutdown actions (reason=signal:SIGINT, deadline=10.0s)
+UI Automation resources released
+Shutdown action 'detector' finished
+Shutdown action 'popup' finished
+Shutdown action 'sound' finished
+Shutdown action 'tk-root' finished
+Shutdown action 'stop-signal' finished
+Removed PID file: /workspace/mtalk_notifier.pid
+Shutdown action 'pid-file' finished
+Shutdown complete
+Shutdown watchdog: clean exit observed
+MTalk notifier stopped
+```
+
+Total elapsed time: ~1 second.
+
 ### Autostart on login (optional)
 
 1. Press `Win + R`, type `shell:startup`, hit Enter.
@@ -147,21 +212,26 @@ The notifier will then start silently on every login.
 ```
 config.json                # target rooms / accounts + settings
 run.bat / run_hidden.pyw   # background launchers for Windows
+stop.bat                   # graceful stop (named event -> file -> taskkill)
 requirements.txt
 sounds/
   generate_warning_wav.py  # stdlib-only fallback WAV generator
   warning.wav              # produced by the script above
 src/
-  main.py                  # CLI entry point
+  main.py                  # CLI entry point, PID file, signal wiring
   notifier.py              # Tk main-thread coordinator
-  detector.py              # UI Automation detector + dedup state machine
+  detector.py              # UI Automation detector + UIA/COM cleanup
   popup.py                 # Alert popup with Mute button
-  sound_player.py          # pygame-based player with stop()
+  sound_player.py          # pygame-based player with idempotent shutdown
+  shutdown.py              # ShutdownCoordinator (LIFO + timeouts + watchdog)
+  stop_signal.py           # Windows named event + stop.request watcher
   config.py                # AppConfig dataclass + loader
 tests/
   test_config.py
   test_detector_helpers.py
+  test_detector_shutdown.py
   test_detector_state.py
+  test_shutdown.py
 ```
 
 ## Running the tests

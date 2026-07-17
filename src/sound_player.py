@@ -21,10 +21,13 @@ class SoundPlayer:
         self._sound_file = Path(sound_file)
         self._lock = threading.Lock()
         self._initialised = False
+        self._shut_down = False
         self._sound = None  # type: Optional[object]
         self._channel = None  # type: Optional[object]
 
     def _ensure_initialised(self) -> bool:
+        if self._shut_down:
+            return False
         if self._initialised:
             return True
         try:
@@ -91,12 +94,21 @@ class SoundPlayer:
             self._channel = None
 
     def shutdown(self) -> None:
+        """Stop playback and release the audio mixer. Idempotent."""
+        with self._lock:
+            if self._shut_down:
+                return
+            self._shut_down = True
+
         self.stop()
+
         if self._initialised:
             try:
                 import pygame
 
                 pygame.mixer.quit()
+                log.info("Audio mixer released")
             except Exception:  # pragma: no cover
-                pass
+                log.exception("pygame.mixer.quit failed")
             self._initialised = False
+            self._sound = None
